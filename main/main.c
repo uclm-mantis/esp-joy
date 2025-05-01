@@ -11,6 +11,7 @@
 #define TARGET_NAME "Pro Controller"
 #define INQ_DURATION 10  // seconds
 
+
 // GAP callback for device discovery
 static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
 // HIDH callback for HID Host events
@@ -68,7 +69,7 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
         }
     } else if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT) {
         if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
-            ESP_LOGI(TAG, "Inquiry complete");
+            ESP_LOGI(TAG, "Inquiry complete...");
         }
     }
 }
@@ -92,7 +93,10 @@ typedef struct __attribute__((packed)) {
         uint16_t turbo:1;
         uint16_t reserved2:2;
     };
-    int8_t dpad;
+    struct {
+        int8_t dpad:4;
+        int8_t reserved3:4;
+    };
     uint16_t lx;
     uint16_t ly;
     uint16_t rx;
@@ -135,10 +139,8 @@ static void hidh_cb(esp_hidh_cb_event_t event, esp_hidh_cb_param_t *param) {
             int length = param->data_ind.len;
             if (length >= sizeof(joydata_t)) {
                 joydata_t* data = (joydata_t*)param->data_ind.data;
-                uint32_t* p = (uint32_t*)data;
-                uint16_t b = (*p >> 8) & 0xFFFF;
-                ESP_LOGI(TAG, "b=%04x, buttons=%s, dpad=%d, lx=%d, ly=%d, rx=%d, ry=%d",
-                         b, buttons(data), (int)data->dpad, data->lx, data->ly, data->rx, data->ry);
+                ESP_LOGI(TAG, "buttons=%s, dpad=%d, lx=%d, ly=%d, rx=%d, ry=%d",
+                         buttons(data), (int)data->dpad, data->lx, data->ly, data->rx, data->ry);
             }
             break;
         }
