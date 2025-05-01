@@ -1,13 +1,3 @@
-/* =====================================================================
-   sdkconfig.defaults (at project root)
-
-   # Enable Classic Bluetooth and HID Host Role for ESP32-WROVER-IB on ESP-IDF v5.4
-   CONFIG_BT_ENABLED=y
-   CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=1        # Classic BT only
-   CONFIG_BT_HID_HOST_ENABLED=y               # Enable Bluedroid HID Host
-   ===================================================================== */
-
-/* main.c */
 #include <stdio.h>
 #include <string.h>
 #include "nvs_flash.h"
