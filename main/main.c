@@ -8,7 +8,6 @@
 #include "esp_log.h"
 
 #define TAG "BT_HID_HOST"
-#define TARGET_NAME "Pro Controller"
 #define INQ_DURATION 10  // seconds
 
 
@@ -58,7 +57,8 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
                     char name[32] = {0};
                     memcpy(name, &eir[2], len - 1);
                     name[len - 1] = '\0';
-                    if (strcmp(name, TARGET_NAME) == 0) {
+                    ESP_LOGI(TAG, "Found device: %s", name);
+                    if (strcmp(name, "Pro Controller") == 0) {
                         ESP_LOGI(TAG, "Found %s, connecting...", name);
                         ESP_ERROR_CHECK(esp_bt_gap_cancel_discovery());
                         ESP_ERROR_CHECK(esp_bt_hid_host_connect(param->disc_res.bda));
