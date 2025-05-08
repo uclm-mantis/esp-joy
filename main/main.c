@@ -1,302 +1,198 @@
-#include <stdio.h>
-#include <string.h>
-#include "nvs_flash.h"
-#include "esp_log.h"
-#include "esp_nimble_hci.h"
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
+/* =====================================================================
+   BLE HID Host example using NimBLE on ESP32 (ESP-IDF v5.4)
+   - BLE (no Classic) to connect to a HID over GATT device (e.g., EasySMX T37)
+   - Uses NimBLE stack
+   ===================================================================== */
 
-#include "host/ble_hs.h"
-#include "host/ble_hs_adv.h"
-#include "host/ble_gap.h"
-#include "services/gap/ble_svc_gap.h"
-#include "host/ble_gatt.h"
-
-#define TAG                    "BLE_HID_HOST"
-#define TARGET_NAME            "Fire TV Remote"
-#define HIDS_SERVICE_UUID16    0x1812
-#define INPUT_REPORT_UUID16    0x2A4D
-#define SCAN_DURATION_SECONDS  10
-#define SCAN_DURATION_MS       (SCAN_DURATION_SECONDS * 1000)
-
-static uint8_t own_addr_type;
-static struct {
-    uint16_t start;
-    uint16_t end;
-    uint16_t input_val_handle;
-    uint16_t cccd_handle;
-} hid_handles;
-
-// Prototipos de callbacks
-static void     ble_on_reset(int reason);
-static void     ble_on_sync(void);
-static void     ble_host_task(void *param);
-static int      ble_gap_event(struct ble_gap_event *event, void *arg);
-static int      gatt_svc_discover(uint16_t conn_handle,
-                                  const struct ble_gatt_error *error,
-                                  const struct ble_gatt_svc *service,
-                                  void *arg);
-static int      gatt_chr_discover(uint16_t conn_handle,
-                                  const struct ble_gatt_error *error,
-                                  const struct ble_gatt_chr *chr,
-                                  void *arg);
-static int      gatt_dsc_discover(uint16_t conn_handle,
-                                  const struct ble_gatt_error *error,
-                                  uint16_t chr_val_handle,
-                                  const struct ble_gatt_dsc *dsc,
-                                  void *arg);
-static int      gatt_notify_cb(uint16_t conn_handle,
+   #include <stdio.h>
+   #include <string.h>
+   #include "nvs_flash.h"
+   #include "esp_nimble_hci.h"
+   #include "nimble/nimble_port.h"
+   #include "nimble/nimble_port_freertos.h"
+   #include "host/ble_hs.h"
+   #include "host/ble_uuid.h"
+   #include "host/ble_hs_id.h"
+   #include "host/ble_hs_cfg.h"
+   #include "host/util/util.h"
+   #include "host/ble_gatt.h"
+   #include "esp_log.h"
+   
+   static const char *TAG = "BLE_HID_HOST";
+   static uint16_t conn_handle;
+   
+   // HID over GATT service and input report characteristic UUIDs
+   static const ble_uuid16_t hid_svc_uuid = BLE_UUID16_INIT(0x1812);
+   static const ble_uuid16_t input_rep_uuid = BLE_UUID16_INIT(0x2A4D);
+   
+   // Scan parameters
+   static const struct ble_gap_disc_params scan_params = {
+       .itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN,
+       .window = BLE_GAP_SCAN_FAST_WINDOW,
+       .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+       .passive = 0,
+   };
+   
+   // Forward declarations
+   static int ble_gap_event(struct ble_gap_event *event, void *arg);
+   static int gatt_svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                               const struct ble_gatt_svc *service, void *arg);
+   static int gatt_chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                               const struct ble_gatt_chr *chr, void *arg);
+   static int gatt_dsc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                               const struct ble_gatt_dsc *dsc, void *arg);
+   
+   void ble_app_on_sync(void) {
+       // Begin scanning
+       ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HCI_SCAN_TYPE_ACTI,
+                    &scan_params, ble_gap_event, NULL);
+       ESP_LOGI(TAG, "BLE scan started");
+   }
+   
+   void ble_app_on_reset(int reason) {
+       ESP_LOGE(TAG, "BLE reset; reason=%d", reason);
+   }
+   
+   void host_task(void *param) {
+       nimble_port_run();
+   }
+   
+   void app_main(void) {
+       // Initialize NVS
+       esp_err_t ret = nvs_flash_init();
+       ESP_ERROR_CHECK(ret);
+   
+       // Initialize NimBLE
+       esp_nimble_hci_and_controller_init();
+       nimble_port_init();
+   
+       // Configure host
+       ble_hs_cfg.reset_cb = ble_app_on_reset;
+       ble_hs_cfg.sync_cb = ble_app_on_sync;
+       ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+   
+       // Start host task
+       nimble_port_freertos_init(host_task);
+   }
+   
+   static int ble_gap_event(struct ble_gap_event *event, void *arg) {
+       switch (event->type) {
+       case BLE_GAP_EVENT_DISC: {
+           struct ble_hs_adv_fields fields;
+           ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data);
+           // Look for HID service UUID
+           for (int i = 0; i < fields.num_uuids16; i++) {
+               if (fields.uuids16[i].u16 == hid_svc_uuid.u.value) {
+                   ESP_LOGI(TAG, "Found HID device, connecting...");
+                   ble_gap_disc_cancel();
+                   ble_gap_connect(BLE_OWN_ADDR_PUBLIC,
+                                   &event->disc.addr,
+                                   BLE_HCI_CONN_LE,
+                                   ble_gap_event,
+                                   NULL);
+                   return 0;
+               }
+           }
+           return 0;
+       }
+       case BLE_GAP_EVENT_CONNECT:
+           if (event->connect.status == 0) {
+               conn_handle = event->connect.conn_handle;
+               ESP_LOGI(TAG, "Connected, handle=%d", conn_handle);
+               // Discover HID service
+               ble_gattc_disc_svc_by_uuid(conn_handle,
+                                          (ble_uuid_t *)&hid_svc_uuid,
+                                          gatt_svc_disc_cb,
+                                          NULL);
+           } else {
+               ESP_LOGE(TAG, "Connect failed; status=%d", event->connect.status);
+               ble_gap_disc(BLE_OWN_ADDR_PUBLIC,
+                            BLE_HCI_SCAN_TYPE_ACTI,
+                            &scan_params,
+                            ble_gap_event,
+                            NULL);
+           }
+           return 0;
+       case BLE_GAP_EVENT_DISCONNECT:
+           ESP_LOGI(TAG, "Disconnected; reason=%d", event->disconnect.reason);
+           ble_gap_disc(BLE_OWN_ADDR_PUBLIC,
+                        BLE_HCI_SCAN_TYPE_ACTI,
+                        &scan_params,
+                        ble_gap_event,
+                        NULL);
+           return 0;
+       case BLE_GAP_EVENT_NOTIFY_RX:
+           // Received HID report
+           ESP_LOGI(TAG, "HID report len=%d", event->notify_rx.om->om_len);
+           // Process event->notify_rx.om->om_data here
+           return 0;
+       default:
+           return 0;
+       }
+   }
+   
+   static int gatt_svc_disc_cb(uint16_t conn_hdl,
                                const struct ble_gatt_error *error,
-                               struct ble_gatt_attr *attr,
-                               void *arg);
-
-void app_main(void)
-{
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // 1) Inicializa controlador + HCI NimBLE
-    nimble_port_init();
-
-    // 2) Configura callbacks del host NimBLE
-    ble_hs_cfg.reset_cb        = ble_on_reset;
-    ble_hs_cfg.sync_cb         = ble_on_sync;
-
-    // 3) Arranca la tarea de NimBLE
-    nimble_port_freertos_init(ble_host_task);
-}
-
-// Called when the controller or host resets
-static void ble_on_reset(int reason)
-{
-    ESP_LOGE(TAG, "Resetting state; reason=%d", reason);
-}
-
-// Called when the BLE host and controller are synced and ready
-static void ble_on_sync(void)
-{
-    int rc;
-
-    // Determina type de dirección (public o random)
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed; rc=%d", rc);
-        return;
-    }
-
-    // Inicializa el cliente GATT
-    rc = ble_gattc_init();
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gattc_init failed; rc=%d", rc);
-        return;
-    }
-
-    // Parámetros de scanning
-    struct ble_gap_disc_params disc_params;
-    memset(&disc_params, 0, sizeof(disc_params));
-    disc_params.passive       = 0;
-    disc_params.itvl          = 0x50;
-    disc_params.window        = 0x30;
-    disc_params.filter_policy = BLE_HCI_SCAN_FILT_NO_WL;
-    disc_params.limited       = 0;
-
-    ESP_LOGI(TAG, "Starting BLE scan for %d seconds…", SCAN_DURATION_SECONDS);
-    rc = ble_gap_disc(own_addr_type,
-                      SCAN_DURATION_MS,
-                      &disc_params,
-                      ble_gap_event,
-                      NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_disc failed; rc=%d", rc);
-    }
-}
-
-// Tarea que ejecuta el loop de NimBLE
-static void ble_host_task(void *param)
-{
-    nimble_port_run();
-    nimble_port_freertos_deinit();
-}
-
-// GAP event handler: DISC, CONNECT, DISCONNECT, etc.
-static int ble_gap_event(struct ble_gap_event *event, void *arg)
-{
-    switch (event->type) {
-    case BLE_GAP_EVENT_DISC: {
-        struct ble_hs_adv_fields fields;
-        int rc = ble_hs_adv_parse_fields(&fields,
-                                         event->disc.data,
-                                         event->disc.length_data);
-        if (rc == 0 && fields.name_len) {
-            char name[32];
-            memcpy(name, fields.name, fields.name_len);
-            name[fields.name_len] = '\0';
-            ESP_LOGI(TAG, "DISC %s", name);
-            if (strcmp(name, TARGET_NAME) == 0) {
-                ESP_LOGI(TAG, "Found %s, connecting…", name);
-                ble_gap_disc_cancel();
-                rc = ble_gap_connect(own_addr_type,
-                                     &event->disc.addr,
-                                     30000,         // timeout ms
-                                     NULL,          // use default connection params
-                                     ble_gap_event,
-                                     NULL);
-                if (rc != 0) {
-                    ESP_LOGE(TAG, "ble_gap_connect failed; rc=%d", rc);
-                }
-                return 0;
-            }
-        }
-        break;
-    }
-
-    case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) {
-            ESP_LOGI(TAG, "Connection established; discovering HID service…");
-            ble_uuid16_t svc_uuid = BLE_UUID16_INIT(HIDS_SERVICE_UUID16);
-            int rc = ble_gattc_disc_svc_by_uuid(event->connect.conn_handle,
-                                                &svc_uuid.u,
-                                                gatt_svc_discover,
-                                                NULL);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "ble_gattc_disc_svc_by_uuid failed; rc=%d", rc);
-            }
-        } else {
-            ESP_LOGW(TAG, "Connection failed; status=%d", event->connect.status);
-            ESP_LOGI(TAG, "Restarting scan");
-            ble_on_sync();
-        }
-        break;
-
-    case BLE_GAP_EVENT_DISC_COMPLETE:
-        ESP_LOGI(TAG, "Scan complete; restarting…");
-        ble_on_sync();
-        break;
-
-    case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGW(TAG, "Disconnected; reason=%d", event->disconnect.reason);
-        ESP_LOGI(TAG, "Restarting scan");
-        ble_on_sync();
-        break;
-
-    default:
-        break;
-    }
-    return 0;
-}
-
-// Descubre el servicio HID (UUID 0x1812)
-static int gatt_svc_discover(uint16_t conn_handle,
-                             const struct ble_gatt_error *error,
-                             const struct ble_gatt_svc *service,
-                             void *arg)
-{
-    if (error->status != 0) {
-        ESP_LOGE(TAG, "Service discovery error; status=%d", error->status);
-        return 0;
-    }
-
-    ble_uuid16_t uuid = BLE_UUID16_INIT(HIDS_SERVICE_UUID16);
-    if (ble_uuid_cmp(&service->uuid.u, &uuid.u) == 0) {
-        hid_handles.start = service->start_handle;
-        hid_handles.end   = service->end_handle;
-        ESP_LOGI(TAG, "Found HID service %d…%d",
-                 hid_handles.start, hid_handles.end);
-
-        // Ahora descubre la característica Input Report (0x2A4D)
-        ble_uuid16_t chr_uuid = BLE_UUID16_INIT(INPUT_REPORT_UUID16);
-        int rc = ble_gattc_disc_chrs_by_uuid(conn_handle,
-                                             hid_handles.start,
-                                             hid_handles.end,
-                                             &chr_uuid.u,
-                                             gatt_chr_discover,
-                                             NULL);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Characteristic discovery failed; rc=%d", rc);
-        }
-    }
-    return 0;
-}
-
-// Descubre la característica Input Report
-static int gatt_chr_discover(uint16_t conn_handle,
-                             const struct ble_gatt_error *error,
-                             const struct ble_gatt_chr *chr,
-                             void *arg)
-{
-    if (error->status != 0) {
-        ESP_LOGE(TAG, "Char discover error; status=%d", error->status);
-        return 0;
-    }
-
-    ble_uuid16_t uuid = BLE_UUID16_INIT(INPUT_REPORT_UUID16);
-    if (ble_uuid_cmp(&chr->uuid.u, &uuid.u) == 0) {
-        hid_handles.input_val_handle = chr->val_handle;
-        ESP_LOGI(TAG, "Found Input Report char; value_handle=%d",
-                 chr->val_handle);
-
-        // Descubre todos los descriptores para luego encontrar el CCCD
-        int rc = ble_gattc_disc_all_dscs(conn_handle,
-                                         hid_handles.input_val_handle,
-                                         hid_handles.end,
-                                         gatt_dsc_discover,
-                                         NULL);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Descriptor discovery failed; rc=%d", rc);
-        }
-    }
-    return 0;
-}
-
-// Descubre el descriptor CCCD (0x2902) y habilita notificaciones
-static int gatt_dsc_discover(uint16_t conn_handle,
-                             const struct ble_gatt_error *error,
-                             uint16_t chr_val_handle,
-                             const struct ble_gatt_dsc *dsc,
-                             void *arg)
-{
-    if (error->status != 0) {
-        ESP_LOGE(TAG, "Descriptor discover error; status=%d", error->status);
-        return 0;
-    }
-
-    ble_uuid16_t cccd_uuid = BLE_UUID16_INIT(0x2902);
-    if (ble_uuid_cmp(&dsc->uuid.u, &cccd_uuid.u) == 0) {
-        hid_handles.cccd_handle = dsc->handle;
-        ESP_LOGI(TAG, "Found CCCD handle=%d", dsc->handle);
-
-        // Habilita notificaciones
-        uint8_t notify_en[2] = {0x01, 0x00};
-        int rc = ble_gattc_write_flat(conn_handle,
-                                      dsc->handle,
-                                      notify_en,
-                                      sizeof(notify_en),
-                                      gatt_notify_cb,
-                                      NULL);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Failed to write CCCD; rc=%d", rc);
-        }
-    }
-    return 0;
-}
-
-// Callback para recibir notificaciones del Input Report
-static int gatt_notify_cb(uint16_t conn_handle,
-                          const struct ble_gatt_error *error,
-                          struct ble_gatt_attr *attr,
-                          void *arg)
-{
-    if (error->status != 0) {
-        ESP_LOGE(TAG, "Notify error; status=%d", error->status);
-        return 0;
-    }
-    ESP_LOGI(TAG, "Notification on handle=%d, len=%d",
-             attr->handle, attr->om->om_len);
-    ESP_LOG_BUFFER_HEX(TAG, attr->om->om_data, attr->om->om_len);
-    return 0;
-}
+                               const struct ble_gatt_svc *service,
+                               void *arg) {
+       if (error->status != 0) {
+           ESP_LOGE(TAG, "Service discovery failed; status=%d", error->status);
+           return 0;
+       }
+       ESP_LOGI(TAG, "HID service: start=%d end=%d",
+                service->start_handle,
+                service->end_handle);
+       // Discover characteristics
+       ble_gattc_disc_all_chrs(conn_hdl,
+                                service->start_handle,
+                                service->end_handle,
+                                gatt_chr_disc_cb,
+                                NULL);
+       return 0;
+   }
+   
+   static int gatt_chr_disc_cb(uint16_t conn_hdl,
+                               const struct ble_gatt_error *error,
+                               const struct ble_gatt_chr *chr,
+                               void *arg) {
+       if (error->status != 0) {
+           ESP_LOGE(TAG, "Chr discovery failed; status=%d", error->status);
+           return 0;
+       }
+       if (ble_uuid_cmp(&chr->uuid.u,
+                        (ble_uuid_t *)&input_rep_uuid) == 0) {
+           ESP_LOGI(TAG, "Found Input Report chr; handle=%d", chr->val_handle);
+           // Subscribe to notifications (CCCD)
+           uint16_t desc_uuid = BLE_UUID16_DECLARE(0x2902);
+           ble_gattc_disc_all_dscs(conn_hdl,
+                                    chr->val_handle,
+                                    chr->val_handle + 1,
+                                    gatt_dsc_disc_cb,
+                                    NULL);
+       }
+       return 0;
+   }
+   
+   static int gatt_dsc_disc_cb(uint16_t conn_hdl,
+                               const struct ble_gatt_error *error,
+                               const struct ble_gatt_dsc *dsc,
+                               void *arg) {
+       if (error->status != 0) {
+           ESP_LOGE(TAG, "Desc discovery failed; status=%d", error->status);
+           return 0;
+       }
+       if (ble_uuid_cmp(&dsc->uuid.u,
+                        BLE_UUID16_DECLARE(0x2902)) == 0) {
+           ESP_LOGI(TAG, "Found CCCD; handle=%d", dsc->handle);
+           // Enable notifications
+           uint16_t npref = htole16(0x0001);
+           ble_gattc_write_flat(conn_hdl,
+                                 dsc->handle,
+                                 &npref,
+                                 sizeof(npref),
+                                 NULL,
+                                 NULL);
+       }
+       return 0;
+   }
+   
